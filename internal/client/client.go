@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"mime"
 	"net"
 	"net/http"
@@ -72,23 +73,21 @@ func (s *Sender) Send(peer discovery.Peer, paths []string, pin string) {
 }
 
 func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
-	// Build file metadata keyed by a generated fileId.
-	files := make(map[string]protocol.FileMetadata, len(paths))
-	pathByID := make(map[string]string, len(paths))
-	for _, p := range paths {
-		fi, err := os.Stat(p)
-		if err != nil {
-			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, FileName: filepath.Base(p), Err: err})
-			continue
-		}
+	// Expand any directories into their files, then build metadata keyed by a
+	// generated fileId. A directory's files carry a relative FileName (e.g.
+	// "Trip/day1/img.jpg") so the receiver can recreate the folder structure.
+	items := s.expand(paths)
+	files := make(map[string]protocol.FileMetadata, len(items))
+	pathByID := make(map[string]string, len(items))
+	for _, it := range items {
 		id := randID()
 		files[id] = protocol.FileMetadata{
 			ID:       id,
-			FileName: filepath.Base(p),
-			Size:     fi.Size(),
-			FileType: mimeType(p),
+			FileName: it.name,
+			Size:     it.size,
+			FileType: mimeType(it.path),
 		}
-		pathByID[id] = p
+		pathByID[id] = it.path
 	}
 	if len(files) == 0 {
 		return
@@ -122,6 +121,57 @@ func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
 		}
 		s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.FileDone, ID: key, FileName: meta.FileName, Received: meta.Size, Total: meta.Size})
 	}
+}
+
+// fileItem is one concrete file to upload: its path on disk, the relative name
+// advertised to the peer (carries folder structure), and its size.
+type fileItem struct {
+	path string
+	name string
+	size int64
+}
+
+// expand turns the selected paths into a flat list of files. A regular file is
+// passed through with its base name. A directory is walked recursively; each
+// contained file's advertised name is its path relative to the directory's
+// parent, so the selected folder itself is recreated on the receiver (selecting
+// "Trip" yields "Trip/day1/img.jpg", …). Unreadable entries are skipped with an
+// error event rather than aborting the whole transfer.
+func (s *Sender) expand(paths []string) []fileItem {
+	var items []fileItem
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, FileName: filepath.Base(p), Err: err})
+			continue
+		}
+		if !fi.IsDir() {
+			items = append(items, fileItem{path: p, name: filepath.Base(p), size: fi.Size()})
+			continue
+		}
+		root := filepath.Dir(filepath.Clean(p)) // parent, so the folder name is kept
+		_ = filepath.WalkDir(p, func(fp string, d fs.DirEntry, err error) error {
+			if err != nil {
+				s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, FileName: filepath.Base(fp), Err: err})
+				return nil // skip this entry, keep walking the rest
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, FileName: filepath.Base(fp), Err: err})
+				return nil
+			}
+			rel, err := filepath.Rel(root, fp)
+			if err != nil {
+				rel = filepath.Base(fp)
+			}
+			items = append(items, fileItem{path: fp, name: filepath.ToSlash(rel), size: info.Size()})
+			return nil
+		})
+	}
+	return items
 }
 
 func (s *Sender) prepareUpload(base string, files map[string]protocol.FileMetadata, pin string) (protocol.PrepareUploadResponse, error) {

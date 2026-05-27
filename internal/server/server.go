@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -251,10 +252,10 @@ func (s *Server) writeFile(sess *session, fe *fileEntry, key string, r io.Reader
 	s.mu.Lock()
 	dir := s.receiveDir
 	s.mu.Unlock()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dest, err := destPath(dir, fe.meta.FileName)
+	if err != nil {
 		return "", err
 	}
-	dest := uniquePath(dir, fe.meta.FileName)
 	tmp := dest + ".part"
 
 	f, err := os.Create(tmp)
@@ -297,22 +298,40 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// uniquePath returns a non-colliding path in dir for the (sanitised) filename.
-func uniquePath(dir, name string) string {
-	base := filepath.Base(filepath.Clean("/" + name)) // strip any path components / traversal
-	if base == "." || base == "/" || base == "" {
-		base = "file"
+// destPath resolves a safe, non-colliding path under dir for the (possibly
+// nested) filename, creating parent directories. Sub-paths are honoured so a
+// folder send recreates its structure, but any traversal is neutralised:
+// cleaning against a leading "/" collapses ".." at the root, and a final
+// containment check guarantees the result stays within dir.
+func destPath(dir, name string) (string, error) {
+	rel := strings.TrimPrefix(filepath.Clean("/"+filepath.ToSlash(name)), "/")
+	if rel == "" || rel == "." {
+		rel = "file"
 	}
-	candidate := filepath.Join(dir, base)
-	if _, err := os.Stat(candidate); os.IsNotExist(err) {
-		return candidate
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	if full != dir && !strings.HasPrefix(full, dir+string(os.PathSeparator)) {
+		return "", fmt.Errorf("unsafe destination for %q", name)
 	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return "", err
+	}
+	return uniqueAt(full), nil
+}
+
+// uniqueAt returns full if free, otherwise inserts " (n)" before the extension
+// until it finds an unused name in the same directory.
+func uniqueAt(full string) string {
+	if _, err := os.Stat(full); os.IsNotExist(err) {
+		return full
+	}
+	d := filepath.Dir(full)
+	base := filepath.Base(full)
 	ext := filepath.Ext(base)
 	stem := base[:len(base)-len(ext)]
 	for i := 1; ; i++ {
-		candidate = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+		cand := filepath.Join(d, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		if _, err := os.Stat(cand); os.IsNotExist(err) {
+			return cand
 		}
 	}
 }

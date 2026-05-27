@@ -358,6 +358,13 @@ func (m Model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q":
 		m.quitting = true
 		return m, tea.Quit
+	case "a":
+		// Stage the folder currently being browsed; it is expanded into its
+		// files (structure preserved) when the transfer starts.
+		if dir := m.picker.CurrentDirectory; dir != "" && !contains(m.staged, dir) {
+			m.staged = append(m.staged, dir)
+		}
+		return m, nil
 	case "backspace":
 		if len(m.staged) > 0 {
 			m.staged = m.staged[:len(m.staged)-1]
@@ -686,12 +693,16 @@ func (m Model) stagedPanel() string {
 		BorderForeground(muted).
 		Padding(0, 1)
 	if len(m.staged) == 0 {
-		return border.Render(headerStyle.Render("No files staged — press enter on a file to add it."))
+		return border.Render(headerStyle.Render("Nothing staged — enter adds a file, a adds the current folder."))
 	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Staged · %d", len(m.staged))))
 	for _, p := range m.staged {
-		b.WriteString("\n" + valueStyle.Render("• "+collapseHome(p)))
+		label := collapseHome(p)
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			label += "/  (folder)"
+		}
+		b.WriteString("\n" + valueStyle.Render("• "+label))
 	}
 	return border.Render(b.String())
 }
@@ -961,7 +972,7 @@ func (m Model) footerText() string {
 	case m.editing:
 		return "tab/↑↓ move · enter next · ctrl+s save · esc cancel"
 	case m.screen == screenPicker:
-		return "enter stage · backspace unstage · S send · esc back"
+		return "enter stage file · a add folder · backspace unstage · S send · esc back"
 	case m.screen == screenPeers:
 		return "enter send-to · r refresh · / filter · 1-4 switch · q quit"
 	case m.screen == screenTransfers:

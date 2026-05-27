@@ -12,8 +12,9 @@ LocalSend mobile and desktop apps on the same LAN, including their default
   `/register` handshake, with peer aging.
 - **Receive** — incoming files are accepted via a prompt (or auto-accepted) and
   written to the receive directory, with live progress.
-- **Send** — pick a peer, stage files with a built-in file picker, and upload
-  them with progress, rate and ETA.
+- **Send** — pick a peer, stage files (or whole folders) with a built-in file
+  picker, and upload them with progress, rate and ETA. Folders are sent
+  recursively with their structure preserved on the receiver.
 - **Manage** — browse the receive folder, mark received files (or whole folders)
   and delete the ones you no longer want, behind a confirmation prompt.
 - **HTTPS** — generates a self-signed certificate whose fingerprint matches the
@@ -92,7 +93,7 @@ omarchy-send --auto-accept --pin 2468
 
 - `1`/`2`/`3`/`4` or `tab` — switch between Devices / Transfers / Manage / Settings
 - Peers: `enter` send to the selected peer · `r` refresh · `/` filter
-- Send picker: `enter` stage a file · `backspace` unstage · `S` send · `esc` back
+- Send picker: `enter` stage a file · `a` add the current folder · `backspace` unstage · `S` send · `esc` back
 - Incoming prompt: `y` accept · `n` reject
 - Transfers: `c` clear finished
 - Manage: `space` mark file/folder · `a` mark all · `d` delete marked (or the one
