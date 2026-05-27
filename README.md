@@ -53,7 +53,7 @@ downloading.
 
 ```sh
 omarchy-send                      # uses config / sensible defaults
-omarchy-send --alias my-server    # override the advertised name for this run
+omarchy-send --alias my-server    # override the advertised device name
 omarchy-send --port 53317         # override the listen port
 omarchy-send --dir ~/Downloads    # override the receive directory
 omarchy-send --auto-accept        # accept incoming transfers without a prompt
@@ -66,6 +66,15 @@ omarchy-send --no-icons           # drop Nerd Font glyphs (non-Nerd-Font termina
 On Omarchy, the TUI reads the active theme's `~/.config/omarchy/current/theme/colors.toml`
 and matches it. Elsewhere (headless / over SSH) it falls back to **ANSI palette
 colours**, so it tracks whatever colour scheme the connecting terminal uses.
+
+### Device name
+
+On first run, each device is given a random, friendly display name such as
+**"Crimson Quasar"** (a colour + a celestial object), generated once and saved.
+This avoids broadcasting your machine's hostname to everyone on the network —
+handy on a laptop joining untrusted Wi-Fi. The hostname is still carried in the
+device-model field, and you can set any name you like with `--alias` or the `e`
+key in the Settings tab.
 
 Config (including the generated TLS identity) is stored at
 `~/.config/omarchy-send/config.json`. Received files default to `~/Omarchy-Send/`.

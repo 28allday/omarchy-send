@@ -49,7 +49,11 @@ func defaults() Config {
 	}
 	home, _ := os.UserHomeDir()
 	return Config{
-		Alias:       host,
+		// Alias is intentionally empty here; Load generates a random sci-fi
+		// alias once on first run (see randomAlias) and persists it. The
+		// hostname is still carried in DeviceModel so the machine stays
+		// identifiable to peers that look past the display name.
+		Alias:       "",
 		Port:        protocol.DefaultPort,
 		ReceiveDir:  filepath.Join(home, "Omarchy-Send"),
 		DeviceModel: host,
@@ -85,8 +89,10 @@ func Load() (Config, error) {
 
 	// Backfill anything still empty after unmarshalling an older/partial file.
 	d := defaults()
+	// Generate a sci-fi alias once on first run (no file, or a file with no
+	// alias). It is persisted below, so the name stays stable across restarts.
 	if cfg.Alias == "" {
-		cfg.Alias = d.Alias
+		cfg.Alias = randomAlias()
 	}
 	if cfg.Port == 0 {
 		cfg.Port = d.Port
