@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"omarchy-send/internal/dbg"
 	"omarchy-send/internal/discovery"
@@ -28,12 +29,24 @@ import (
 	"omarchy-send/internal/transfer"
 )
 
+// errOpen wraps a failure to open a source file, so the send loop can skip just
+// that file rather than aborting the whole batch (which it does for peer/network
+// errors, where the shared session is dead).
+var errOpen = errors.New("open source file")
+
+// inflight tracks one running send so it can be cancelled — e.g. when a newer
+// transfer to the same peer supersedes it.
+type inflight struct {
+	cancel context.CancelFunc
+}
+
 // Sender uploads files to peers. Events are delivered on Events().
 type Sender struct {
 	mu     sync.Mutex
 	self   protocol.DeviceInfo
 	http   *http.Client
 	events chan transfer.Event
+	active map[string]*inflight // in-flight sends keyed by peer IP
 }
 
 // New returns a Sender advertising self. TLS chain validation is disabled (we
@@ -42,10 +55,19 @@ func New(self protocol.DeviceInfo) *Sender {
 	return &Sender{
 		self: self,
 		http: &http.Client{
-			Timeout:   0, // large files: no overall timeout
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			// No overall timeout (large files), but bound the parts that can
+			// silently wedge on a vanished peer: connecting, the TLS handshake,
+			// and waiting for response headers after the body is sent.
+			Timeout: 0,
+			Transport: &http.Transport{
+				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
 		},
 		events: make(chan transfer.Event, 256),
+		active: make(map[string]*inflight),
 	}
 }
 
@@ -73,6 +95,26 @@ func (s *Sender) Send(peer discovery.Peer, paths []string, pin string) {
 }
 
 func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
+	// A new transfer to a peer supersedes any still-running one to the same
+	// peer: cancel it so a half-finished old batch can't carry on once the user
+	// starts something new.
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &inflight{cancel: cancel}
+	s.mu.Lock()
+	if prev := s.active[peer.IP]; prev != nil {
+		prev.cancel()
+	}
+	s.active[peer.IP] = h
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		if s.active[peer.IP] == h {
+			delete(s.active, peer.IP)
+		}
+		s.mu.Unlock()
+	}()
+
 	// Expand any directories into their files, then build metadata keyed by a
 	// generated fileId. A directory's files carry a relative FileName (e.g.
 	// "Trip/day1/img.jpg") so the receiver can recreate the folder structure.
@@ -97,7 +139,7 @@ func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
 		dbg.Logf("SEND prepare-upload to %s: files=%s", peer.IP, string(meta))
 	}
 	base := s.url(peer)
-	prepResp, err := s.prepareUpload(base, files, pin)
+	prepResp, err := s.prepareUpload(ctx, base, files, pin)
 	if err != nil {
 		dbg.Logf("send prepare-upload to %s failed: %v", peer.IP, err)
 		if errors.Is(err, transfer.ErrPinRequired) {
@@ -114,12 +156,31 @@ func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
 	for id, token := range prepResp.Files {
 		meta := files[id]
 		key := prepResp.SessionID + ":" + id
-		if err := s.uploadFile(base, prepResp.SessionID, id, token, key, pathByID[id], meta); err != nil {
-			dbg.Logf("send upload %q failed: %v", meta.FileName, err)
-			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, ID: key, FileName: meta.FileName, Err: err})
+
+		// If the transfer was cancelled (superseded, or aborted after an earlier
+		// failure), don't push the rest of the batch — report a clean cancel.
+		if ctx.Err() != nil {
+			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Cancel, ID: key, FileName: meta.FileName})
 			continue
 		}
-		s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.FileDone, ID: key, FileName: meta.FileName, Received: meta.Size, Total: meta.Size})
+
+		err := s.uploadFile(ctx, base, prepResp.SessionID, id, token, key, pathByID[id], meta)
+		if err == nil {
+			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.FileDone, ID: key, FileName: meta.FileName, Received: meta.Size, Total: meta.Size})
+			continue
+		}
+		dbg.Logf("send upload %q failed: %v", meta.FileName, err)
+		if ctx.Err() != nil {
+			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Cancel, ID: key, FileName: meta.FileName})
+		} else {
+			s.emit(transfer.Event{Dir: transfer.Outgoing, Kind: transfer.Error, ID: key, FileName: meta.FileName, Err: err})
+		}
+		// A failure to open a local file is specific to that file — skip it and
+		// keep going. Any other failure means the peer/session is gone, so abort
+		// the rest of the batch (the shared session can't be resumed).
+		if !errors.Is(err, errOpen) {
+			cancel()
+		}
 	}
 }
 
@@ -174,13 +235,18 @@ func (s *Sender) expand(paths []string) []fileItem {
 	return items
 }
 
-func (s *Sender) prepareUpload(base string, files map[string]protocol.FileMetadata, pin string) (protocol.PrepareUploadResponse, error) {
+func (s *Sender) prepareUpload(ctx context.Context, base string, files map[string]protocol.FileMetadata, pin string) (protocol.PrepareUploadResponse, error) {
 	reqBody, _ := json.Marshal(protocol.PrepareUploadRequest{Info: s.selfCopy(), Files: files})
 	url := base + protocol.PathPrepareUpload
 	if pin != "" {
 		url += "?pin=" + neturl.QueryEscape(pin)
 	}
-	resp, err := s.http.Post(url, "application/json", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return protocol.PrepareUploadResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.http.Do(req)
 	if err != nil {
 		return protocol.PrepareUploadResponse{}, err
 	}
@@ -198,10 +264,10 @@ func (s *Sender) prepareUpload(base string, files map[string]protocol.FileMetada
 	return pr, nil
 }
 
-func (s *Sender) uploadFile(base, sessionID, fileID, token, key, path string, meta protocol.FileMetadata) error {
+func (s *Sender) uploadFile(ctx context.Context, base, sessionID, fileID, token, key, path string, meta protocol.FileMetadata) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errOpen, err)
 	}
 	defer f.Close()
 
@@ -216,7 +282,7 @@ func (s *Sender) uploadFile(base, sessionID, fileID, token, key, path string, me
 	}
 
 	url := fmt.Sprintf("%s%s?sessionId=%s&fileId=%s&token=%s", base, protocol.PathUpload, sessionID, fileID, token)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
 	if err != nil {
 		return err
 	}
