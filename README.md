@@ -12,9 +12,13 @@ LocalSend mobile and desktop apps on the same LAN, including their default
   `/register` handshake, with peer aging.
 - **Receive** — incoming files are accepted via a prompt (or auto-accepted) and
   written to the receive directory, with live progress.
-- **Send** — pick a peer, stage files (or whole folders) with a built-in file
-  picker, and upload them with progress, rate and ETA. Folders are sent
-  recursively with their structure preserved on the receiver.
+- **Send** — pick a peer, then find what to send with a built-in **recursive
+  fuzzy finder**: type part of a name to match files (and folders) anywhere under
+  your home directory, stage them, and upload with progress, rate and ETA.
+  Folders are sent recursively with their structure preserved on the receiver.
+- **Right-click in Nautilus** (Omarchy desktop) — "Send via Omarchy-Send" on any
+  file or folder opens the picker in a floating terminal with your selection
+  already staged; just pick a device. Installed only where Nautilus is present.
 - **Messages** — send a plain-text message to a peer (LocalSend-compatible) and
   read messages others send you in a dedicated Messages tab. Send the system
   clipboard as a message, or copy a received one back to the clipboard (uses
@@ -30,8 +34,9 @@ LocalSend mobile and desktop apps on the same LAN, including their default
 - **HTTPS** — generates a self-signed certificate whose fingerprint matches the
   scheme the official client pins (uppercase-hex SHA-256 of the cert DER), so
   stock encrypted peers talk to it with no configuration.
-- **Single static binary**, pure-stdlib protocol layer; only the Charm TUI
-  libraries are external dependencies.
+- **Single static binary**, pure-stdlib protocol layer; the only external
+  dependencies are the Charm TUI libraries and `sahilm/fuzzy` (the send finder's
+  matcher) — both compiled in, so headless boxes need nothing extra.
 
 ## Install
 
@@ -91,6 +96,34 @@ isn't found or the send fails. It starts discovery only — not the receiver —
 it's safe to run while another `omarchy-send` instance is up. Both `--to` and
 `--message` are required; file sending stays in the TUI for now.
 
+### Sending files
+
+Select a device on the **Devices** tab and press `enter` to open the send
+finder. It indexes files and folders under your home directory and fuzzy-matches
+as you type, so you can jump straight to what you want instead of browsing
+folder by folder:
+
+- type to filter · `↑`/`↓` move · `enter` stage the highlighted file **or folder**
+- `ctrl+d` show folders only (to send a whole directory) · `ctrl+s` send · `ctrl+u`
+  move the search root up a level · `esc` back
+
+Staging a folder sends it whole (its structure is recreated on the receiver).
+Matching is case-insensitive, and noisy directories (`.git`, `node_modules`,
+caches, dotfiles…) are skipped to keep the index fast.
+
+### Right-click send (Nautilus)
+
+On an Omarchy desktop, the installer adds a **"Send via Omarchy-Send"** entry to
+the Nautilus context menu. Right-click one or more files or folders (multi-select
+works) and choose it: a floating terminal opens with your selection pre-staged on
+the device list — pick a device and it sends, then the window closes itself once
+the transfer finishes.
+
+This is a graphical convenience and is **desktop-only**: it's installed only when
+Nautilus is present, so headless servers don't get it (and don't need it — use
+the TUI or headless send there). Under the hood it just runs
+`omarchy-send <paths…>`, which you can call yourself from any terminal.
+
 ### Theming
 
 On Omarchy, the TUI reads the active theme's `~/.config/omarchy/current/theme/colors.toml`
@@ -123,7 +156,7 @@ omarchy-send --auto-accept --pin 2468
 - `1`–`5` or `tab` — switch between Devices / Transfers / Manage / Messages / Settings
 - Peers: `enter` send to the selected peer · `m` message · `v` send clipboard · `r` refresh · `/` filter
 - PIN-protected peers: messages prompt for the PIN and retry, just like file sends
-- Send picker: `enter` stage a file · `a` add the current folder · `backspace` unstage · `S` send · `esc` back
+- Send finder: type to fuzzy-filter · `enter` stage file/folder · `ctrl+d` folders-only · `ctrl+s` send · `ctrl+u` up a dir · `esc` back
 - Incoming prompt: `y` accept · `n` reject
 - Transfers: `c` clear finished
 - Messages: `enter` read the full message · `y` copy it to the clipboard · `d`

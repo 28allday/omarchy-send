@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,10 +41,26 @@ func (c controller) Send(p discovery.Peer, paths []string, pin string) { c.sende
 func (c controller) SendMessage(p discovery.Peer, text, pin string) {
 	c.sender.SendMessage(p, text, pin)
 }
-func (c controller) SetAutoAccept(v bool)     { c.srv.SetAutoAccept(v) }
-func (c controller) SetPIN(pin string)        { c.srv.SetPIN(pin) }
-func (c controller) SetReceiveDir(dir string) { c.srv.SetReceiveDir(dir) }
-func (c controller) SetNotify(v bool)         { c.notify.Store(v) }
+
+// The Set* receiver/server toggles no-op when there is no server — quick-send
+// mode (Nautilus right-click) runs server-less so it can coexist with an
+// already-running instance without fighting over the listen port.
+func (c controller) SetAutoAccept(v bool) {
+	if c.srv != nil {
+		c.srv.SetAutoAccept(v)
+	}
+}
+func (c controller) SetPIN(pin string) {
+	if c.srv != nil {
+		c.srv.SetPIN(pin)
+	}
+}
+func (c controller) SetReceiveDir(dir string) {
+	if c.srv != nil {
+		c.srv.SetReceiveDir(dir)
+	}
+}
+func (c controller) SetNotify(v bool) { c.notify.Store(v) }
 
 // SetAlias updates the alias across all services and re-announces it.
 func (c controller) SetAlias(alias string) {
@@ -114,6 +131,21 @@ func main() {
 		os.Exit(runHeadlessSend(cfg, *toFlag, *messageFlag, *sendPINFlag, *waitFlag))
 	}
 
+	// Quick-send: any positional arguments are file/folder paths to send (the
+	// Nautilus right-click integration calls `omarchy-send <paths…>`). Open the
+	// TUI with them pre-staged, on the device list.
+	if args := flag.Args(); len(args) > 0 {
+		paths := make([]string, 0, len(args))
+		for _, a := range args {
+			if abs, err := filepath.Abs(a); err == nil {
+				paths = append(paths, abs)
+			} else {
+				paths = append(paths, a)
+			}
+		}
+		os.Exit(runQuickSend(cfg, paths))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -171,6 +203,37 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runQuickSend opens the TUI on the device list with paths pre-staged, so the
+// user just picks a recipient. It runs server-less (discovery + sender only),
+// like runHeadlessSend, so it coexists with an already-running receiver instead
+// of crashing on the busy listen port.
+func runQuickSend(cfg config.Config, paths []string) int {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	disc := discovery.New(cfg.DeviceInfo())
+	if err := disc.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "discovery: %v\n", err)
+		return 1
+	}
+	sender := client.New(cfg.DeviceInfo())
+
+	// No receiver in quick-send mode, so nothing to notify about.
+	notifyOff := &atomic.Bool{}
+	ctrl := controller{disc: disc, sender: sender, srv: nil, notify: notifyOff}
+
+	p := tea.NewProgram(tui.New(cfg, ctrl, tui.WithStagedFiles(paths)), tea.WithAltScreen())
+	app.BridgeDiscovery(ctx, disc.Events(), p.Send)
+	app.BridgeTransfers(ctx, sender.Events(), p.Send)
+	disc.Announce() // solicit replies immediately rather than waiting a tick
+
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // runHeadlessSend discovers the peer whose alias matches target (case-

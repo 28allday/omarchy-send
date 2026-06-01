@@ -1,7 +1,7 @@
 // Package tui implements the Bubble Tea front end. It routes between Devices,
-// Transfers, Manage (received-file housekeeping) and Settings screens, offers a
-// file picker for sending, and raises modal prompts for incoming files and for
-// confirming deletions.
+// Transfers, Manage (received-file housekeeping), Messages and Settings screens,
+// offers a recursive fuzzy file finder for sending, and raises modal prompts for
+// incoming files and for confirming deletions.
 package tui
 
 import (
@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -80,8 +79,19 @@ type Model struct {
 	peerList list.Model
 	peers    map[string]discovery.Peer
 
-	picker filepicker.Model
-	staged []string        // file paths queued to send
+	// Send screen: a recursive fuzzy file finder ("fzf") rooted at fzfRoot.
+	fzfQuery    textinput.Model // the fuzzy query input
+	fzfRoot     string          // directory currently indexed
+	fzfEntries  []fzfEntry      // files+dirs found under fzfRoot
+	fzfRels     []string        // entry paths relative to fzfRoot (match corpus)
+	fzfMatches  []int           // indexes into fzfEntries, best-ranked first
+	fzfCursor   int             // selected row within fzfMatches
+	fzfIndexing bool            // a walk is in flight
+	fzfTrunc    bool            // the walk hit the entry cap
+	fzfDirsOnly bool            // show only folders (pick a whole dir to send)
+	fzfErr      string          // last walk error
+
+	staged []string        // file/dir paths queued to send
 	target *discovery.Peer // peer we're sending to
 
 	bar       progress.Model
@@ -122,12 +132,39 @@ type Model struct {
 	readingMsg   *server.ReceivedMessage // non-nil while reading a message full-screen
 	notice       string                  // transient footer flash (e.g. "message sent")
 
+	// quickSend is set by WithStagedFiles: the TUI opens with files already
+	// staged and selecting a device on the Devices screen sends them straight
+	// away (used by the Nautilus right-click integration).
+	quickSend bool
+	// quitAfterSend (also set by WithStagedFiles) auto-closes the window once
+	// the outgoing transfer completes, so the right-click box doesn't linger.
+	// quitPending guards against scheduling more than one quit tick at a time.
+	quitAfterSend bool
+	quitPending   bool
+
 	width, height int
 	quitting      bool
 }
 
+// Option customizes a Model at construction.
+type Option func(*Model)
+
+// WithStagedFiles opens the TUI in quick-send mode: paths are pre-staged and
+// picking a device on the Devices screen sends them immediately, skipping the
+// file finder. Empty input is a no-op (normal startup).
+func WithStagedFiles(paths []string) Option {
+	return func(m *Model) {
+		if len(paths) == 0 {
+			return
+		}
+		m.staged = append([]string(nil), paths...)
+		m.quickSend = true
+		m.quitAfterSend = true
+	}
+}
+
 // New returns the root model. ctrl may be nil (e.g. in tests).
-func New(cfg config.Config, ctrl Controller) Model {
+func New(cfg config.Config, ctrl Controller, opts ...Option) Model {
 	applyTheme(theme.Load()) // match the active Omarchy theme
 
 	l := list.New(nil, deviceDelegate{icons: !cfg.NoIcons}, 0, 0)
@@ -146,19 +183,12 @@ func New(cfg config.Config, ctrl Controller) Model {
 	ml.SetShowHelp(false)
 	ml.SetShowStatusBar(false)
 
-	fp := filepicker.New()
-	if home, err := os.UserHomeDir(); err == nil {
-		fp.CurrentDirectory = home
-	}
-	fp.AutoHeight = false
-	fp.Styles.Cursor = fp.Styles.Cursor.Foreground(accent)
-	fp.Styles.Selected = fp.Styles.Selected.Foreground(accent).Bold(true)
-	fp.Styles.Directory = fp.Styles.Directory.Foreground(accent)
-	fp.Styles.File = fp.Styles.File.Foreground(text)
-	fp.Styles.FileSize = fp.Styles.FileSize.Foreground(muted)
-	fp.Styles.Permission = fp.Styles.Permission.Foreground(muted)
-	fp.Styles.Symlink = fp.Styles.Symlink.Foreground(dim)
-	fp.Styles.EmptyDirectory = fp.Styles.EmptyDirectory.Foreground(muted)
+	fzfQuery := textinput.New()
+	fzfQuery.Prompt = "› "
+	fzfQuery.Placeholder = "type to fuzzy-find files…"
+	fzfQuery.CharLimit = 128
+	fzfQuery.Width = 48
+	fzfQuery.PromptStyle = lipgloss.NewStyle().Foreground(accent)
 
 	pin := textinput.New()
 	pin.Placeholder = "PIN"
@@ -182,7 +212,7 @@ func New(cfg config.Config, ctrl Controller) Model {
 		mkInput("PIN (blank = disabled)", 16),
 	}
 
-	return Model{
+	m := Model{
 		cfg:          cfg,
 		ctrl:         ctrl,
 		ips:          server.LocalIPs(),
@@ -191,7 +221,7 @@ func New(cfg config.Config, ctrl Controller) Model {
 		peers:        make(map[string]discovery.Peer),
 		fileList:     fl,
 		marked:       marked,
-		picker:       fp,
+		fzfQuery:     fzfQuery,
 		bar:          progress.New(progress.WithDefaultGradient(), progress.WithWidth(22)),
 		xferIndex:    make(map[string]*xfer),
 		autoAccept:   cfg.AutoAccept,
@@ -200,6 +230,10 @@ func New(cfg config.Config, ctrl Controller) Model {
 		msgList:      ml,
 		composeInput: compose,
 	}
+	for _, o := range opts {
+		o(&m)
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd { return nil }
@@ -216,10 +250,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.peerList.SetSize(iw, lh)
 		m.fileList.SetSize(iw, lh)
 		m.msgList.SetSize(iw, lh)
-		if ph := ih - 8; ph >= 3 {
-			m.picker.Height = ph
-		} else {
-			m.picker.Height = 3
+		if qw := iw - 4; qw > 8 {
+			m.fzfQuery.Width = qw
 		}
 		return m, nil
 
@@ -247,12 +279,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 		m.applyTransfer(msg.Ev)
+		return m, m.maybeScheduleQuit()
+
+	case autoQuitMsg:
+		// The debounce elapsed — quit only if the send is still complete (a new
+		// file may have started since, e.g. mid-folder).
+		m.quitPending = false
+		if m.allSendsDoneOK() {
+			m.quitting = true
+			return m, tea.Quit
+		}
 		return m, nil
 
 	case app.MessageMsg:
 		m.messages = append([]server.ReceivedMessage{msg.Msg}, m.messages...)
 		m.msgList.SetItems(m.msgItems())
 		m.notice = "✉ message from " + nonEmpty(msg.Msg.From, "a device")
+		return m, nil
+
+	case fzfIndexedMsg:
+		if msg.root != m.fzfRoot {
+			return m, nil // a stale walk for a root we've since left
+		}
+		m.fzfIndexing = false
+		m.fzfEntries = msg.entries
+		m.fzfTrunc = msg.trunc
+		if msg.err != nil {
+			m.fzfErr = msg.err.Error()
+		} else {
+			m.fzfErr = ""
+		}
+		m.fzfRels = make([]string, len(msg.entries))
+		for i, e := range msg.entries {
+			m.fzfRels[i] = e.rel
+		}
+		m.recomputeMatches()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -286,7 +347,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateAccept(msg)
 		}
 		if m.screen == screenPicker {
-			return m.updatePicker(msg)
+			return m.updateFzf(msg)
 		}
 		if m.screen == screenPeers && m.peerList.FilterState() == list.Filtering {
 			break
@@ -445,10 +506,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenPeers {
 				if it, ok := m.peerList.SelectedItem().(peerItem); ok {
 					peer := it.p
+					// Quick-send (Nautilus right-click): files are already
+					// staged — selecting a device sends them straight away. A
+					// PIN-required peer still routes through the PIN prompt via
+					// sendPeer/sendPaths.
+					if m.quickSend && len(m.staged) > 0 && m.ctrl != nil {
+						m.sendPeer = &peer
+						m.sendPaths = m.staged
+						m.pendingMsg = ""
+						m.ctrl.Send(peer, m.staged, "")
+						m.staged = nil
+						m.quickSend = false
+						m.screen = screenTransfers
+						return m, nil
+					}
 					m.target = &peer
 					m.staged = nil
+					home, err := os.UserHomeDir()
+					if err != nil || home == "" {
+						home = "."
+					}
+					m.fzfRoot = home
+					m.fzfQuery.SetValue("")
+					m.fzfQuery.Focus()
+					m.fzfEntries, m.fzfRels, m.fzfMatches, m.fzfCursor = nil, nil, nil, 0
+					m.fzfErr = ""
+					m.fzfDirsOnly = false
+					m.fzfIndexing = true
 					m.screen = screenPicker
-					return m, m.picker.Init()
+					return m, tea.Batch(indexFiles(home), textinput.Blink)
 				}
 			}
 			if m.screen == screenMessages {
@@ -463,7 +549,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.pending == nil && m.screen == screenPicker {
 		var cmd tea.Cmd
-		m.picker, cmd = m.picker.Update(msg)
+		m.fzfQuery, cmd = m.fzfQuery.Update(msg)
 		return m, cmd
 	}
 	if m.pending == nil && m.screen == screenPeers {
@@ -524,49 +610,6 @@ func (m *Model) deleteSelectedMessage() {
 		}
 	}
 	m.msgList.SetItems(m.msgItems())
-}
-
-// updatePicker handles the file picker / staging screen.
-func (m Model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.screen = screenPeers
-		return m, nil
-	case "ctrl+c", "q":
-		m.quitting = true
-		return m, tea.Quit
-	case "a":
-		// Stage the folder currently being browsed; it is expanded into its
-		// files (structure preserved) when the transfer starts.
-		if dir := m.picker.CurrentDirectory; dir != "" && !contains(m.staged, dir) {
-			m.staged = append(m.staged, dir)
-		}
-		return m, nil
-	case "backspace":
-		if len(m.staged) > 0 {
-			m.staged = m.staged[:len(m.staged)-1]
-		}
-		return m, nil
-	case "S":
-		if len(m.staged) > 0 && m.target != nil && m.ctrl != nil {
-			m.sendPeer = m.target
-			m.sendPaths = m.staged
-			m.pendingMsg = "" // this is a file send, not a message
-			m.ctrl.Send(*m.target, m.staged, "")
-			m.staged = nil
-			m.screen = screenTransfers
-		}
-		return m, nil
-	}
-
-	var cmd tea.Cmd
-	m.picker, cmd = m.picker.Update(msg)
-	if ok, path := m.picker.DidSelectFile(msg); ok {
-		if !contains(m.staged, path) {
-			m.staged = append(m.staged, path)
-		}
-	}
-	return m, cmd
 }
 
 // beginEdit enters the settings edit form, prefilling current values.
@@ -690,6 +733,36 @@ func (m Model) updateAccept(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// autoQuitMsg fires after the post-send debounce to close a quick-send window.
+type autoQuitMsg struct{}
+
+// allSendsDoneOK reports whether every transfer has completed successfully —
+// the trigger for auto-closing a quick-send window. A still-active, errored, or
+// cancelled transfer (or none at all) returns false, so the window stays open
+// for the user to see what happened.
+func (m *Model) allSendsDoneOK() bool {
+	if len(m.transfers) == 0 {
+		return false
+	}
+	for _, x := range m.transfers {
+		if x.state != "done" {
+			return false
+		}
+	}
+	return true
+}
+
+// maybeScheduleQuit arms a debounced auto-quit when a quick-send has fully
+// completed. The delay lets the user glimpse the ✓ and lets the next file in a
+// multi-file/folder send start before we re-check at fire time.
+func (m *Model) maybeScheduleQuit() tea.Cmd {
+	if !m.quitAfterSend || m.quitPending || !m.allSendsDoneOK() {
+		return nil
+	}
+	m.quitPending = true
+	return tea.Tick(1200*time.Millisecond, func(time.Time) tea.Msg { return autoQuitMsg{} })
+}
+
 func (m *Model) applyTransfer(ev transfer.Event) {
 	x, ok := m.xferIndex[ev.ID]
 	if !ok {
@@ -785,9 +858,17 @@ func (m Model) View() string {
 	switch m.screen {
 	case screenPeers:
 		if len(m.peers) == 0 {
-			body, center = headerStyle.Render("Searching for devices on the network…"), true
+			msg := "Searching for devices on the network…"
+			if m.quickSend {
+				msg += fmt.Sprintf("\n\n%d item(s) ready — pick a device to send.", len(m.staged))
+			}
+			body, center = headerStyle.Render(msg), true
 		} else {
-			body = deviceHeader() + "\n" + m.peerList.View()
+			head := deviceHeader()
+			if m.quickSend {
+				head = titleStyle.Render(fmt.Sprintf("Send %d item(s) — select a device:", len(m.staged))) + "\n" + head
+			}
+			body = head + "\n" + m.peerList.View()
 		}
 	case screenTransfers:
 		if len(m.transfers) == 0 {
@@ -817,7 +898,7 @@ func (m Model) View() string {
 			body, center = m.settingsView(), true
 		}
 	case screenPicker:
-		body = m.pickerView()
+		body = m.sendView()
 	}
 	if center {
 		body = centerIn(cw, ih, body)
@@ -866,22 +947,6 @@ func (m Model) tabBar() string {
 	return " " + tab("Devices", screenPeers) + tab("Transfers", screenTransfers) + tab("Manage", screenManage) + tab("Messages", screenMessages) + tab("Settings", screenSettings)
 }
 
-func (m Model) pickerView() string {
-	target := ""
-	if m.target != nil {
-		target = m.target.Info.Alias
-	}
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Send to " + target))
-	b.WriteString("  ")
-	b.WriteString(headerStyle.Render(collapseHome(m.picker.CurrentDirectory)))
-	b.WriteString("\n\n")
-	b.WriteString(m.picker.View())
-	b.WriteString("\n")
-	b.WriteString(m.stagedPanel())
-	return b.String()
-}
-
 // stagedPanel renders the queued files as a bordered box (or a hint when empty).
 func (m Model) stagedPanel() string {
 	border := lipgloss.NewStyle().
@@ -889,7 +954,7 @@ func (m Model) stagedPanel() string {
 		BorderForeground(muted).
 		Padding(0, 1)
 	if len(m.staged) == 0 {
-		return border.Render(headerStyle.Render("Nothing staged — enter adds a file, a adds the current folder."))
+		return border.Render(headerStyle.Render("Nothing staged — enter stages the highlighted file or folder."))
 	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Staged · %d", len(m.staged))))
@@ -1175,7 +1240,9 @@ func (m Model) footerText() string {
 	case m.editing:
 		return "tab/↑↓ move · enter next · ctrl+s save · esc cancel"
 	case m.screen == screenPicker:
-		return "enter stage file · a add folder · backspace unstage · S send · esc back"
+		return "type filter · ↑↓ move · enter stage · ctrl+d folders-only · ctrl+s send · ctrl+u up-dir · esc back"
+	case m.screen == screenPeers && m.quickSend:
+		return fmt.Sprintf("enter send %d item(s) to selected device · r refresh · q cancel", len(m.staged))
 	case m.screen == screenPeers:
 		return "enter send-to · m message · v send-clipboard · r refresh · / filter · 1-5 · q quit"
 	case m.screen == screenTransfers:

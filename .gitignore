@@ -1,3 +1,5 @@
 /omarchy-send
 /dist/omarchy-send-linux-*
 *.tmp
+__pycache__/
+*.pyc
