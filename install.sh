@@ -256,6 +256,98 @@ else
   echo "==> Headless system — installed as a plain TUI."
 fi
 
+# ---- agent context (AGENTS.md / CLAUDE.md) -------------------------------
+# Install a context file so any AI agent on this machine (Claude, etc.) knows
+# what omarchy-send is and — crucially — WHERE files land when other devices
+# send them here. The canonical copy lives in the config dir as AGENTS.md (the
+# cross-agent standard) with a CLAUDE.md symlink beside it; a short managed
+# section is also added to ~/.claude/CLAUDE.md so it's known in every session.
+CFG_DIR="$HOME/.config/omarchy-send"
+mkdir -p "$CFG_DIR"
+
+# Resolve the real receive directory: the config's receiveDir wins, else default.
+RECV_DIR="$HOME/Omarchy-Send"
+if [ -f "$CFG_DIR/config.json" ]; then
+  _rd="$(grep -oE '"receiveDir"[[:space:]]*:[[:space:]]*"[^"]*"' "$CFG_DIR/config.json" \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' | head -n1)"
+  [ -n "${_rd:-}" ] && RECV_DIR="$_rd"
+fi
+
+# AGENTS.md — quoted heredoc (so backticks stay literal); @@RECV_DIR@@ filled after.
+cat > "$CFG_DIR/AGENTS.md" <<'DOC'
+# Omarchy-Send — context for AI agents
+
+**What it is:** Omarchy-Send is a terminal (TUI) file-transfer tool installed on
+this machine. It speaks the LocalSend protocol, so phones, desktops, and other
+servers can send **files** and **plain-text messages** to this machine over the
+local network or a Tailscale tailnet. It can also send outbound.
+
+**Where received files live —** incoming files are saved under the *receive
+directory*:
+
+    @@RECV_DIR@@
+
+That is the current value; the authoritative source is the `receiveDir` key in
+`~/.config/omarchy-send/config.json` — read it if unsure. Details:
+
+- A file still transferring has a temporary `.part` suffix and is renamed to its
+  real name only when complete. Treat `*.part` files as incomplete — skip them.
+- Filename collisions are de-duplicated (e.g. `photo (1).jpg`).
+- A sent *folder* is recreated as a subdirectory tree under the receive dir.
+- Plain-text **messages** are not written to disk — they appear in the TUI's
+  Messages tab while the receiver is running.
+
+**How it runs:** files are received only while a receiver is running — it is a
+foreground TUI, not a background daemon. Start it with:
+
+    omarchy-send
+
+On a headless box, run it inside a TTY (tmux, or `ssh -t`). It listens on TCP
+port **53317**. Auto-accept and an optional PIN live in the config / Settings tab.
+
+**Config:** `~/.config/omarchy-send/config.json`
+(keys: `alias`, `receiveDir`, `port`, `autoAccept`, `pin`, `knownPeers`, …).
+
+**If asked to "find / process what was just sent":** look in the receive
+directory above and skip any `*.part` files (still transferring).
+DOC
+sed -i "s|@@RECV_DIR@@|$RECV_DIR|g" "$CFG_DIR/AGENTS.md"
+ln -sf AGENTS.md "$CFG_DIR/CLAUDE.md"
+echo "==> Wrote agent context: $CFG_DIR/AGENTS.md (+ CLAUDE.md symlink)."
+
+# Managed, idempotent section in the user-global Claude memory.
+CLAUDE_MD="$HOME/.claude/CLAUDE.md"
+mkdir -p "$HOME/.claude"
+[ -f "$CLAUDE_MD" ] || : > "$CLAUDE_MD"
+BEGIN_MARK="<!-- BEGIN omarchy-send (managed by installer) -->"
+END_MARK="<!-- END omarchy-send (managed by installer) -->"
+
+# Build the fresh block (placeholder substituted) in a temp file.
+blk="$(mktemp)"
+cat > "$blk" <<'BLK'
+<!-- BEGIN omarchy-send (managed by installer) -->
+## Omarchy-Send (installed on this machine)
+
+Omarchy-Send is a LocalSend-compatible terminal file-transfer tool; other devices
+send files/messages to this box over LAN/Tailscale (TCP 53317). **Files sent here
+land in `@@RECV_DIR@@`** (authoritative: the `receiveDir` key in
+`~/.config/omarchy-send/config.json`). Files still transferring carry a `.part`
+suffix — skip them. Text messages appear in the TUI's Messages tab, not on disk.
+Receiving requires the TUI running (`omarchy-send`; use tmux or `ssh -t` when
+headless). Full notes: `~/.config/omarchy-send/AGENTS.md`.
+<!-- END omarchy-send (managed by installer) -->
+BLK
+sed -i "s|@@RECV_DIR@@|$RECV_DIR|g" "$blk"
+
+# Strip any prior managed block, then append the fresh one (no duplicates on re-run).
+new_cm="$(mktemp)"
+awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+  $0==b {skip=1} skip && $0==e {skip=0; next} !skip' "$CLAUDE_MD" > "$new_cm"
+# Drop a trailing blank line then re-add exactly one before the block, for tidiness.
+{ cat "$new_cm"; printf '\n'; cat "$blk"; } > "$CLAUDE_MD"
+rm -f "$blk" "$new_cm"
+echo "    Added an Omarchy-Send section to $CLAUDE_MD."
+
 # ---- firewall posture ----------------------------------------------------
 # Shared by the remote-mode lockdown below and the local-mode public-IP warning.
 #

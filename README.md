@@ -55,6 +55,11 @@ Omarchy also adds a floating Walker entry (search **Omarchy-Send**) and the
 Nautilus right-click integration. Override the location with `BIN_DIR=/usr/local/bin`,
 or pin a version with `OMARCHY_SEND_VERSION=v0.1.0`.
 
+The installer also drops an **agent context file** so any AI agent on the machine
+(Claude, etc.) knows what omarchy-send is and where received files land: a canonical
+`~/.config/omarchy-send/AGENTS.md` (with a `CLAUDE.md` symlink) plus a short,
+idempotently-managed section appended to `~/.claude/CLAUDE.md`.
+
 **Local or remote?** When run interactively the installer asks whether this is a
 **local** machine (home/LAN) or a **remote server** (public IP). Local installs as
 above. For a remote server it additionally locks port `53317` to the Tailscale
