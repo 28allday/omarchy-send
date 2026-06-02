@@ -270,6 +270,13 @@ if [ -f /.dockerenv ] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2
   IN_CONTAINER=1
 fi
 
+# A routable public IPv4 means $PORT is reachable from the internet unless
+# firewalled. Excludes loopback, link-local, RFC1918 and CGNAT/Tailscale
+# (100.64.0.0/10). Empty when the box is purely on private/tailnet addresses.
+PUBLIC_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+  | grep -vE '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+  | head -n1 || true)"
+
 # ---- remote server: restrict the port to the Tailscale network -----------
 # On a public-IP box, port 53317 would otherwise be reachable from the internet
 # (the receiver binds all interfaces). Lock it to the Tailscale interface so it
@@ -321,6 +328,37 @@ if [ "$MODE" = "remote" ]; then
     echo "      tcp dport $PORT drop"
   fi
   echo "    Tip: a PIN adds a second layer — run with --pin <code> (or set it in Settings)."
+fi
+
+# ---- local mode on a public-IP box: inform, don't touch the firewall -----
+# We never change the firewall outside remote mode, but a public IP means the
+# port is internet-exposed while the TUI is open — so surface it with the exact
+# commands to lock it down. (Covers the silent `curl | bash` default-to-local
+# case, where the interactive remote prompt never ran.)
+if [ "$MODE" != "remote" ] && [ -n "$PUBLIC_IP" ]; then
+  iface="${TS_IFACE:-tailscale0}"
+  echo
+  echo "⚠  Heads up: this machine has a public IP ($PUBLIC_IP) and was installed in"
+  echo "   LOCAL mode, so port $PORT was NOT firewalled. The receiver binds all"
+  echo "   interfaces, so $PORT is reachable from the internet while the TUI is open."
+  echo "   The installer won't change your firewall without remote mode — lock it to"
+  echo "   your tailnet yourself (recommended):"
+  if [ "$IN_CONTAINER" = "1" ]; then
+    echo "     • You're in a container — apply on the HOST, not in here:  ufw deny $PORT"
+    echo "       (if the host already default-denies inbound, $PORT is already blocked"
+    echo "        from the internet yet still reachable over the tailnet via loopback)."
+  elif command -v ufw >/dev/null 2>&1; then
+    echo "     • ufw allow in on $iface to any port $PORT"
+    echo "     • ufw deny $PORT"
+  else
+    echo "     • nftables (inet filter, input chain):"
+    echo "         iifname \"$iface\" tcp dport $PORT accept"
+    echo "         tcp dport $PORT drop"
+  fi
+  echo "   Or re-run to firewall it automatically:  OMARCHY_SEND_MODE=remote bash install.sh"
+  echo "   And/or set a PIN:  omarchy-send --pin <code>"
+  echo "   Verify with an app-layer probe (raw TCP/nc lie behind some providers):"
+  echo "     curl -sk https://<public-ip>:$PORT/api/localsend/v2/info   # should time out"
 fi
 
 echo

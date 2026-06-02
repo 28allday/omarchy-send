@@ -62,6 +62,11 @@ interface in the firewall (`ufw`), so the box is reachable over your tailnet onl
 not the open internet. Non-interactive installs (e.g. piped `curl | bash`) default
 to local; force a choice with `OMARCHY_SEND_MODE=local` or `OMARCHY_SEND_MODE=remote`.
 
+If you install in local mode but the box has a **public IP**, the installer detects
+it and prints a warning with the exact commands to lock the port down — it never
+changes your firewall without remote mode. See
+[Public-IP boxes](#public-ip-boxes-firewall-the-port) below.
+
 > The installer is a short shell script fetched over HTTPS; read it first if you
 > prefer — it lives at [`install.sh`](install.sh) in this repo.
 
@@ -140,8 +145,47 @@ The receiver already listens on all interfaces, so it's reachable at its Tailsca
 IP with nothing else to configure. Sending and receiving both work, because the
 probe is a two-way handshake (each side learns the other).
 
-> On a box with a public IP, don't leave `53317` open to the internet — install in
-> **remote** mode (above) to firewall it to the tailnet, and/or set a `--pin`.
+#### Public-IP boxes: firewall the port
+
+The receiver binds **all interfaces**, so on a box with a public IP, port `53317`
+is reachable from the open internet while the TUI is running. Don't leave it that
+way. Three ways to handle it:
+
+- **Easiest:** install in **remote** mode — `OMARCHY_SEND_MODE=remote bash install.sh`
+  — and the installer applies the `ufw` rules for you (when a real `tailscale0`
+  interface is present).
+- **Manually**, restrict the port to the tailnet:
+
+  ```sh
+  ufw allow in on tailscale0 to any port 53317   # tailnet only
+  ufw deny 53317                                 # everything else
+  ```
+
+  Or the `nftables` equivalent (inet filter, input chain):
+
+  ```
+  iifname "tailscale0" tcp dport 53317 accept
+  tcp dport 53317 drop
+  ```
+
+- **Inside a container** (e.g. Docker `--network host` with userspace-networking
+  Tailscale, where there's no `tailscale0` and no `CAP_NET_ADMIN`): you can't
+  firewall from in there — apply it on the **host**. If the host already
+  default-denies inbound (only opens e.g. 22/80/443), `53317` is already blocked
+  from the internet yet still reachable over the tailnet (tailscaled delivers it
+  via loopback) — nothing more to do.
+
+Always set a **`--pin`** as a second layer regardless.
+
+> **Verifying** the port is closed: don't trust `nc -z`, `telnet`, or
+> `/dev/tcp` — some hosting providers (Hostinger, DigitalOcean, …) answer the TCP
+> handshake (SYN/ACK) for *every* port at their network edge, so those tools
+> report a firewalled port as "open". Only an **app-layer** probe is truthful:
+>
+> ```sh
+> curl -sk https://<public-ip>:53317/api/localsend/v2/info   # should time out / hang
+> curl -sk https://<tailnet-ip>:53317/api/localsend/v2/info  # returns device info
+> ```
 
 ### Right-click send (Nautilus)
 
