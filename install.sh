@@ -485,14 +485,78 @@ if command -v tailscale >/dev/null 2>&1 && [ -z "$TS_IFACE" ] \
     echo "⚠  Tailscale is running in userspace-networking mode (no TUN interface)"
     echo "   and no SOCKS5 proxy is listening on localhost:1055. This box can"
     echo "   RECEIVE over the tailnet, but CANNOT SEND to tailnet devices until"
-    echo "   tailscaled is restarted with its proxy enabled — add this flag to"
-    echo "   however tailscaled is launched (entrypoint, unit, …), keeping the"
-    echo "   existing --state/--socket flags:"
-    echo
-    echo "       tailscaled --tun=userspace-networking --socks5-server=localhost:1055 …"
-    echo
-    echo "   omarchy-send then uses the proxy automatically — no env vars needed."
-    echo "   (Explicit HTTPS_PROXY/HTTP_PROXY/NO_PROXY are honoured as overrides.)"
+    echo "   tailscaled runs with its proxy enabled."
+
+    # Offer to apply the fix: add --socks5-server=localhost:1055 to whatever
+    # launcher starts tailscaled (e.g. a container entrypoint) and restart it.
+    # Defaults to NO — non-interactive installs never restart someone else's
+    # daemon. OMARCHY_SEND_FIX_TAILSCALE=yes|no skips the prompt.
+    FIX_TS="${OMARCHY_SEND_FIX_TAILSCALE:-}"
+    case "$FIX_TS" in yes | no) : ;; *)
+      FIX_TS="no"
+      if { exec 3<>/dev/tty; } 2>/dev/null; then
+        printf '   Enable it now? The tailscaled launcher gets the flag added and\n   tailscaled is restarted — this briefly drops the tailnet, including\n   any tailscale SSH session. [y/N] ' >&3 || true
+        IFS= read -r _fx <&3 || _fx=""
+        exec 3>&- 3<&- || true
+        case "$_fx" in y | Y | yes | Yes | YES) FIX_TS="yes" ;; esac
+      fi
+      ;;
+    esac
+
+    if [ "$FIX_TS" = "yes" ]; then
+      # 1. Persist: patch every writable launcher script that starts tailscaled
+      #    in userspace mode (idempotent — skips ones already carrying the flag).
+      PATCHED=""
+      while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        if grep -q "socks5-server" "$_f"; then PATCHED="$_f"; continue; fi
+        if [ -w "$_f" ] &&
+          sed -i "s|--tun=userspace-networking|--tun=userspace-networking --socks5-server=localhost:1055|" "$_f" 2>/dev/null; then
+          PATCHED="$_f"
+          echo "   Patched launcher: $_f"
+        fi
+      done < <(grep -rlse '--tun=userspace-networking' \
+        "$HOME/.local/bin" /usr/local/bin /usr/local/sbin 2>/dev/null || true)
+      [ -z "$PATCHED" ] &&
+        echo "   No writable tailscaled launcher found — the restart below won't survive a reboot."
+
+      # 2. Restart tailscaled now with its current flags + the proxy. Needs the
+      #    rights of whoever owns the daemon (root in most containers).
+      RESTARTED=0
+      _pid="$(pgrep -x tailscaled | head -n1 || true)"
+      if [ -n "$_pid" ] && mapfile -d '' _args <"/proc/$_pid/cmdline" 2>/dev/null &&
+        [ "${#_args[@]}" -gt 0 ]; then
+        case " ${_args[*]} " in *socks5-server*) : ;; *) _args+=("--socks5-server=localhost:1055") ;; esac
+        SUDO=""
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+        if [ -z "$SUDO" ] || sudo -n true 2>/dev/null; then
+          $SUDO pkill -x tailscaled 2>/dev/null || true
+          sleep 1
+          # shellcheck disable=SC2086 # $SUDO is deliberately word-split (empty or "sudo -n")
+          ($SUDO nohup "${_args[@]}" >"${TMPDIR:-/tmp}/tailscaled-restart.log" 2>&1 &)
+          sleep 3
+          if (exec 3<>/dev/tcp/127.0.0.1/1055) 2>/dev/null; then RESTARTED=1; fi
+        fi
+      fi
+
+      if [ "$RESTARTED" = "1" ]; then
+        echo "   Done — SOCKS5 proxy is up. Tailnet sends now work, no env vars needed"
+        [ -n "$PATCHED" ] && echo "   (and the patched launcher keeps it working across restarts)."
+      elif [ -n "$PATCHED" ]; then
+        echo "   Launcher patched, but tailscaled couldn't be restarted from here"
+        echo "   (needs root). Restart the container/box and the fix applies itself."
+      else
+        echo "   Couldn't patch or restart automatically. Add this flag wherever"
+        echo "   tailscaled is launched, keeping its existing flags:"
+        echo "       tailscaled --tun=userspace-networking --socks5-server=localhost:1055 …"
+      fi
+    else
+      echo "   Skipped. To fix manually, add this flag wherever tailscaled is"
+      echo "   launched (keeping its existing --state/--socket flags):"
+      echo "       tailscaled --tun=userspace-networking --socks5-server=localhost:1055 …"
+      echo "   omarchy-send then uses the proxy automatically — no env vars needed."
+      echo "   (Or re-run the installer with OMARCHY_SEND_FIX_TAILSCALE=yes.)"
+    fi
   fi
 fi
 

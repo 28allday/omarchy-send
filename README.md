@@ -168,6 +168,13 @@ the auto-detection. The one thing the box must provide is the proxy itself:
 tailscaled --tun=userspace-networking --socks5-server=localhost:1055 …
 ```
 
+The installer detects this situation and **offers to apply the fix** ([y/N]):
+it adds the flag to the launcher script that starts tailscaled (a container
+entrypoint, say) and restarts the daemon — or, when it lacks the rights to
+restart it, patches the launcher and tells you to restart the container/box.
+Non-interactive installs never touch the daemon; pre-answer with
+`OMARCHY_SEND_FIX_TAILSCALE=yes` (or `no`) to skip the prompt.
+
 Note that inbound connections on such boxes appear to come from `127.0.0.1`
 (tailscaled re-dials loopback); omarchy-send keeps a peer's routable address
 rather than letting those registers overwrite it.
