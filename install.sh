@@ -269,7 +269,7 @@ mkdir -p "$CFG_DIR"
 RECV_DIR="$HOME/Omarchy-Send"
 if [ -f "$CFG_DIR/config.json" ]; then
   _rd="$(grep -oE '"receiveDir"[[:space:]]*:[[:space:]]*"[^"]*"' "$CFG_DIR/config.json" \
-    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' | head -n1)"
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' | head -n1 || true)"
   [ -n "${_rd:-}" ] && RECV_DIR="$_rd"
 fi
 
@@ -366,7 +366,7 @@ echo "    Added an Omarchy-Send section to $CLAUDE_MD."
 #
 # Tailscale interface: usually tailscale0, but absent when tailscaled runs in
 # userspace-networking mode (the default inside containers) — don't hardcode it.
-TS_IFACE="$(ip -o link show 2>/dev/null | grep -oE 'tailscale[0-9]+' | head -n1)"
+TS_IFACE="$(ip -o link show 2>/dev/null | grep -oE 'tailscale[0-9]+' | head -n1 || true)"
 
 # Container? Under Docker host-networking the port binds the *host's* stack, and
 # the firewall belongs on the host, not in this namespace.
