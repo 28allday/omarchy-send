@@ -101,24 +101,30 @@ omarchy-send --no-notify          # don't raise desktop notifications on incomin
 
 ### Headless send (no TUI)
 
-Send a one-off message to a peer by name, with no terminal UI — handy from
-scripts, cron, or an SSH session with no TTY:
+Send a one-off message, files, or folders to a peer by name, with no terminal
+UI — handy from scripts, cron, AI agents, or an SSH session with no TTY:
 
 ```sh
 omarchy-send --to "Strong Onion" --message "hello"
 omarchy-send --to "Strong Onion" --message "deploy finished" --wait 20s
 omarchy-send --to "Strong Onion" --message "hi" --send-pin 2468   # if the peer requires a PIN
+omarchy-send --to "Strong Onion" report.pdf photos/               # files and folders
+omarchy-send --to "Strong Onion" --message "build log attached" build.log
 ```
 
 The target is matched against the peer's display name, case-insensitively. The
 command discovers the peer over multicast and, like the TUI, directly probes
 your known peers and online Tailscale peers (waiting up to `--wait`, default
 15s) — so a remote box added with `+` in the TUI, or any tailnet peer, is a
-valid `--to` target from a script too. It sends the message, prints a one-line
-result, and exits non-zero if the peer isn't found or the send fails. It starts
-discovery only — not the receiver — so it's safe to run while another
-`omarchy-send` instance is up. Both `--to` and `--message` are required; file
-sending stays in the TUI for now.
+valid `--to` target from a script too. It sends the message and/or files,
+prints a result line per file, and exits non-zero if the peer isn't found or
+the send fails. It starts discovery only — not the receiver — so it's safe to
+run while another `omarchy-send` instance is up.
+
+`--to` requires a `--message`, file/folder paths, or both (flags must come
+before the paths). A folder is sent whole and its structure recreated on the
+receiver. Paths *without* `--to` instead open the TUI with them pre-staged
+(quick-send) — that form needs a TTY.
 
 ### Sending files
 

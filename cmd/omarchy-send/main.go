@@ -162,7 +162,7 @@ func main() {
 		noNotify  = flag.Bool("no-notify", false, "don't raise desktop notifications on incoming messages/files")
 
 		// Headless one-shot send (no TUI): -to <alias> -message <text>.
-		toFlag      = flag.String("to", "", "headless send: target peer alias to send to (no TUI); requires -message")
+		toFlag      = flag.String("to", "", "headless send: target peer alias to send to (no TUI); combine with -message and/or file paths")
 		messageFlag = flag.String("message", "", "headless send: plain-text message to send to -to")
 		sendPINFlag = flag.String("send-pin", "", "headless send: PIN to present if the target peer requires one")
 		waitFlag    = flag.Duration("wait", 15*time.Second, "headless send: how long to wait for the target peer to be discovered")
@@ -187,7 +187,7 @@ func main() {
 		cfg.Port = *portFlag
 	}
 	if *dirFlag != "" {
-		cfg.ReceiveDir = *dirFlag
+		cfg.ReceiveDir = config.ExpandHome(*dirFlag)
 	}
 	if *pinFlag != "" {
 		cfg.PIN = *pinFlag
@@ -202,29 +202,27 @@ func main() {
 		cfg.NoNotify = true
 	}
 
-	// Headless one-shot send: resolve the target by alias over discovery, send,
-	// and exit — no TUI, no terminal required. Suitable for scripts and cron.
+	// Headless one-shot send: resolve the target by alias over discovery, send
+	// a message and/or positional file/folder paths, and exit — no TUI, no
+	// terminal required. Suitable for scripts, cron, and AI agents.
 	if *toFlag != "" || *messageFlag != "" {
-		if *toFlag == "" || *messageFlag == "" {
-			fmt.Fprintln(os.Stderr, "headless send needs both -to <alias> and -message <text>")
+		paths := absPaths(flag.Args())
+		if *toFlag == "" {
+			fmt.Fprintln(os.Stderr, "headless send needs -to <alias> (plus -message <text> and/or file paths)")
 			os.Exit(2)
 		}
-		os.Exit(runHeadlessSend(cfg, *toFlag, *messageFlag, *sendPINFlag, *waitFlag))
+		if *messageFlag == "" && len(paths) == 0 {
+			fmt.Fprintln(os.Stderr, "headless send needs -message <text>, file/folder paths, or both")
+			os.Exit(2)
+		}
+		os.Exit(runHeadlessSend(cfg, *toFlag, *messageFlag, *sendPINFlag, *waitFlag, paths))
 	}
 
 	// Quick-send: any positional arguments are file/folder paths to send (the
 	// Nautilus right-click integration calls `omarchy-send <paths…>`). Open the
 	// TUI with them pre-staged, on the device list.
 	if args := flag.Args(); len(args) > 0 {
-		paths := make([]string, 0, len(args))
-		for _, a := range args {
-			if abs, err := filepath.Abs(a); err == nil {
-				paths = append(paths, abs)
-			} else {
-				paths = append(paths, a)
-			}
-		}
-		os.Exit(runQuickSend(cfg, paths))
+		os.Exit(runQuickSend(cfg, absPaths(args)))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -321,12 +319,27 @@ func runQuickSend(cfg config.Config, paths []string) int {
 	return 0
 }
 
+// absPaths resolves each path to absolute (best-effort; a path that fails to
+// resolve is passed through as-is and will fail with a clear error later).
+func absPaths(args []string) []string {
+	paths := make([]string, 0, len(args))
+	for _, a := range args {
+		if abs, err := filepath.Abs(a); err == nil {
+			paths = append(paths, abs)
+		} else {
+			paths = append(paths, a)
+		}
+	}
+	return paths
+}
+
 // runHeadlessSend discovers the peer whose alias matches target (case-
-// insensitively), sends it a plain-text message, and returns a process exit
-// code. It deliberately starts only discovery — not the HTTP receiver — so it
-// can run alongside an already-running instance without fighting over the
-// listen port. Status goes to stderr; the success line goes to stdout.
-func runHeadlessSend(cfg config.Config, target, message, sendPIN string, wait time.Duration) int {
+// insensitively), sends it the given file/folder paths and/or a plain-text
+// message, and returns a process exit code. It deliberately starts only
+// discovery — not the HTTP receiver — so it can run alongside an
+// already-running instance without fighting over the listen port. Status goes
+// to stderr; the success lines go to stdout.
+func runHeadlessSend(cfg config.Config, target, message, sendPIN string, wait time.Duration, paths []string) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -364,16 +377,50 @@ func runHeadlessSend(cfg config.Config, target, message, sendPIN string, wait ti
 	}
 
 	sender := client.New(cfg.DeviceInfo())
-	if err := sender.SendMessageSync(peer, message, sendPIN); err != nil {
+
+	reportErr := func(err error) {
 		switch {
 		case errors.Is(err, transfer.ErrPinRequired):
 			fmt.Fprintf(os.Stderr, "%q requires a PIN — pass it with -send-pin.\n", peer.Info.Alias)
 		default:
 			fmt.Fprintf(os.Stderr, "send to %q (%s) failed: %v\n", peer.Info.Alias, peer.IP, err)
 		}
-		return 1
 	}
 
-	fmt.Printf("Message sent to %q (%s).\n", peer.Info.Alias, peer.IP)
+	if len(paths) > 0 {
+		fmt.Fprintf(os.Stderr, "Sending to %q (%s)… (waiting for the peer to accept)\n", peer.Info.Alias, peer.IP)
+		sent := 0
+		err := sender.SendFilesSync(ctx, peer, paths, sendPIN, func(name string, size int64) {
+			sent++
+			fmt.Printf("  sent %s (%s)\n", name, humanBytes(size))
+		})
+		if err != nil {
+			reportErr(err)
+			return 1
+		}
+		fmt.Printf("%d file(s) sent to %q (%s).\n", sent, peer.Info.Alias, peer.IP)
+	}
+
+	if message != "" {
+		if err := sender.SendMessageSync(peer, message, sendPIN); err != nil {
+			reportErr(err)
+			return 1
+		}
+		fmt.Printf("Message sent to %q (%s).\n", peer.Info.Alias, peer.IP)
+	}
 	return 0
+}
+
+// humanBytes renders a byte count as a short human-readable size.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

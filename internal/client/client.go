@@ -137,6 +137,74 @@ func (s *Sender) SendMessageSync(peer discovery.Peer, text, pin string) error {
 	return err
 }
 
+// SendFilesSync uploads the given file/folder paths to peer and blocks until
+// the whole batch is done, returning the error directly — including
+// transfer.ErrPinRequired when the peer needs a PIN. Unlike Send it reports
+// nothing on Events(); it exists for the headless one-shot send path, where
+// there is no TUI to consume events (the progress events uploadFile emits are
+// harmlessly dropped). onDone, when non-nil, is called after each file lands,
+// so the CLI can print per-file progress lines.
+func (s *Sender) SendFilesSync(ctx context.Context, peer discovery.Peer, paths []string, pin string, onDone func(name string, size int64)) error {
+	// Explicitly named paths that don't exist are a hard error up front — in
+	// the TUI a stat failure is just an event on one staged entry, but a script
+	// passing a wrong path wants a non-zero exit, not a silent skip.
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			return err
+		}
+	}
+	items := s.expand(paths)
+	if len(items) == 0 {
+		return errors.New("nothing to send: no readable files under the given paths")
+	}
+
+	files := make(map[string]protocol.FileMetadata, len(items))
+	pathByID := make(map[string]string, len(items))
+	for _, it := range items {
+		id := randID()
+		files[id] = protocol.FileMetadata{
+			ID:       id,
+			FileName: it.name,
+			Size:     it.size,
+			FileType: mimeType(it.path),
+		}
+		pathByID[id] = it.path
+	}
+
+	base := s.url(peer)
+	prepResp, err := s.prepareUpload(ctx, base, files, pin)
+	if err != nil {
+		return err
+	}
+
+	// An empty token map (204) means the peer accepted but wants nothing
+	// uploaded — e.g. it already has the files. That's success: the loop below
+	// simply finds no tokens to push.
+	var skipped []string
+	for id, token := range prepResp.Files {
+		meta := files[id]
+		key := prepResp.SessionID + ":" + id
+		if err := s.uploadFile(ctx, base, prepResp.SessionID, id, token, key, pathByID[id], meta); err != nil {
+			// A failure to open a local file is specific to that file (it
+			// vanished or lost permissions since staging) — skip it and keep
+			// the batch going, like the TUI path does. Anything else means the
+			// peer/session is gone and can't be resumed, so abort the batch.
+			if errors.Is(err, errOpen) {
+				skipped = append(skipped, meta.FileName)
+				continue
+			}
+			return fmt.Errorf("upload %q: %w", meta.FileName, err)
+		}
+		if onDone != nil {
+			onDone(meta.FileName, meta.Size)
+		}
+	}
+	if len(skipped) > 0 {
+		return fmt.Errorf("could not read: %s", strings.Join(skipped, ", "))
+	}
+	return nil
+}
+
 func (s *Sender) send(peer discovery.Peer, paths []string, pin string) {
 	// A new transfer to a peer supersedes any still-running one to the same
 	// peer: cancel it so a half-finished old batch can't carry on once the user
