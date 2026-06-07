@@ -6,10 +6,30 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"omarchy-send/internal/protocol"
 	"omarchy-send/internal/security"
 )
+
+// ExpandHome resolves a leading "~" or "~/" to the user's home directory, so a
+// receiveDir stored as "~/Omarchy-Send" (hand-edited, or typed into the
+// Settings tab) means what the user means — and is not treated as a relative
+// path that silently creates a literal "~" directory under the process cwd.
+func ExpandHome(p string) string {
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return p
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
 
 // Config is the persisted user configuration.
 type Config struct {
@@ -106,6 +126,9 @@ func Load() (Config, error) {
 	if cfg.ReceiveDir == "" {
 		cfg.ReceiveDir = d.ReceiveDir
 	}
+	// Normalise a ~-form receive dir to absolute; Load persists below, so the
+	// stored value is unambiguous from then on.
+	cfg.ReceiveDir = ExpandHome(cfg.ReceiveDir)
 	if cfg.DeviceType == "" {
 		cfg.DeviceType = d.DeviceType
 	}

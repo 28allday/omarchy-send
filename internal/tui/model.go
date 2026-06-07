@@ -734,7 +734,9 @@ func (m Model) saveEdit() (tea.Model, tea.Cmd) {
 		m.cfg.DeviceModel = alias
 	}
 	if dir != "" {
-		m.cfg.ReceiveDir = dir
+		// Expand a typed ~-form immediately so the live server and the saved
+		// config both carry the absolute path.
+		m.cfg.ReceiveDir = config.ExpandHome(dir)
 	}
 	m.cfg.PIN = pin
 	_ = m.cfg.Save()
@@ -1354,21 +1356,10 @@ func collapseHome(p string) string {
 }
 
 // expandHome resolves a leading ~ (or ~/) to the user's home directory. It is
-// the inverse of collapseHome and tolerates the ~-form a user may type into the
-// receive-dir setting.
+// the inverse of collapseHome; the canonical implementation lives in config so
+// every consumer of ReceiveDir expands the same way.
 func expandHome(p string) string {
-	if p == "~" {
-		if home, err := os.UserHomeDir(); err == nil {
-			return home
-		}
-		return p
-	}
-	if strings.HasPrefix(p, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, p[2:])
-		}
-	}
-	return p
+	return config.ExpandHome(p)
 }
 
 func truncate(s string, n int) string {
