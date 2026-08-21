@@ -4,16 +4,39 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"sync"
+	"time"
 
 	"omarchy-send/internal/protocol"
 )
 
+// Bounds on what accepted-but-unused sessions may cost us. A peer that calls
+// prepare-upload and then never uploads used to leave its metadata map behind
+// for good; with auto-accept on, repeating that was unbounded growth.
+const (
+	// sessionTTL is how long an idle session survives. Only sessions with no
+	// upload in flight are ever expired, so a slow transfer is never cut off.
+	sessionTTL = 10 * time.Minute
+
+	// maxSessions bounds concurrent sessions across all peers.
+	maxSessions = 64
+
+	// maxSessionFiles bounds the total file entries held across all sessions,
+	// since one session may declare very many files.
+	maxSessionFiles = 20000
+)
+
+// ErrTooManySessions is returned when accepting another session would exceed
+// the bounds above.
+var ErrTooManySessions = errors.New("too many pending sessions")
+
 // fileEntry tracks one file within a session.
 type fileEntry struct {
-	meta  protocol.FileMetadata
-	token string
-	done  bool
+	meta     protocol.FileMetadata
+	token    string
+	done     bool
+	inflight bool
 }
 
 // session is one accepted prepare-upload, holding per-file tokens and a cancel
@@ -25,6 +48,9 @@ type session struct {
 	files  map[string]*fileEntry // by fileId
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	lastUsed time.Time // for idle expiry
+	active   int       // uploads in flight; a busy session is never expired
 }
 
 // sessionStore is the concurrency-safe registry of active sessions.
@@ -46,15 +72,20 @@ func randToken() string {
 
 // create builds a session for the given files and returns it plus the
 // fileId->token map for the prepare-upload response.
-func (s *sessionStore) create(peer protocol.DeviceInfo, ip string, files map[string]protocol.FileMetadata) (*session, map[string]string) {
+func (s *sessionStore) create(peer protocol.DeviceInfo, ip string, files map[string]protocol.FileMetadata) (*session, map[string]string, error) {
+	// Clear anything that has aged out before deciding whether we are full;
+	// the common case is that an abandoned session simply expires.
+	s.sweep()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &session{
-		id:     randToken(),
-		peer:   peer,
-		ip:     ip,
-		files:  make(map[string]*fileEntry, len(files)),
-		ctx:    ctx,
-		cancel: cancel,
+		id:       randToken(),
+		peer:     peer,
+		ip:       ip,
+		files:    make(map[string]*fileEntry, len(files)),
+		ctx:      ctx,
+		cancel:   cancel,
+		lastUsed: time.Now(),
 	}
 	tokens := make(map[string]string, len(files))
 	for fileID, meta := range files {
@@ -63,14 +94,49 @@ func (s *sessionStore) create(peer protocol.DeviceInfo, ip string, files map[str
 		tokens[fileID] = tok
 	}
 
+	// Check and insert under one hold of the lock: with the check in its own
+	// critical section, parallel prepare-uploads could each pass at 63 sessions
+	// and all insert, exceeding the caps they were checked against.
 	s.mu.Lock()
+	held := 0
+	for _, existing := range s.sessions {
+		held += len(existing.files)
+	}
+	if len(s.sessions) >= maxSessions || held+len(files) > maxSessionFiles {
+		s.mu.Unlock()
+		cancel()
+		return nil, nil, ErrTooManySessions
+	}
 	s.sessions[sess.id] = sess
 	s.mu.Unlock()
-	return sess, tokens
+	return sess, tokens, nil
 }
 
-// lookup returns the session and file entry for an upload, validating the token.
-func (s *sessionStore) lookup(sessionID, fileID, token string) (*session, *fileEntry, bool) {
+// sweep drops sessions that have been idle past sessionTTL. A session with an
+// upload in flight is left alone however long it takes.
+func (s *sessionStore) sweep() {
+	now := time.Now()
+	var dead []*session
+	s.mu.Lock()
+	for id, sess := range s.sessions {
+		if sess.active == 0 && now.Sub(sess.lastUsed) > sessionTTL {
+			delete(s.sessions, id)
+			dead = append(dead, sess)
+		}
+	}
+	s.mu.Unlock()
+	for _, sess := range dead {
+		sess.cancel()
+	}
+}
+
+// claim validates an upload's token and marks the file in flight, atomically.
+// A token is effectively single-use: a file already received, or one with an
+// upload already in flight, cannot be claimed again — otherwise a peer could
+// replay an accepted upload for as long as pending siblings kept the session
+// alive. Claiming also marks the session busy so the sweep cannot expire it
+// mid-transfer.
+func (s *sessionStore) claim(sessionID, fileID, token string) (*session, *fileEntry, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[sessionID]
@@ -78,10 +144,32 @@ func (s *sessionStore) lookup(sessionID, fileID, token string) (*session, *fileE
 		return nil, nil, false
 	}
 	fe, ok := sess.files[fileID]
-	if !ok || fe.token != token {
+	if !ok || fe.token != token || fe.done || fe.inflight {
 		return nil, nil, false
 	}
+	fe.inflight = true
+	sess.active++
+	sess.lastUsed = time.Now()
 	return sess, fe, true
+}
+
+// endUpload releases the busy mark and the file's in-flight claim, restarting
+// the idle clock. A failed upload's token becomes claimable again so the
+// sender can retry the file; a completed one stays done and cannot be reused.
+func (s *sessionStore) endUpload(sessionID, fileID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if sess.active > 0 {
+		sess.active--
+	}
+	if fe, ok := sess.files[fileID]; ok {
+		fe.inflight = false
+	}
+	sess.lastUsed = time.Now()
 }
 
 // cancel aborts a session's in-flight writes and removes it.

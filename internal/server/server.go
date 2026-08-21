@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"omarchy-send/internal/dbg"
@@ -24,6 +25,58 @@ import (
 
 // PeerSink records a peer learned from an inbound request (e.g. /register).
 type PeerSink func(info protocol.DeviceInfo, ip string)
+
+// Caps on what an unauthenticated peer can make us hold in memory or write to
+// disk. /register and /prepare-upload are both reachable before the user has
+// accepted anything, so their JSON bodies are read through a MaxBytesReader
+// rather than straight off the wire.
+const (
+	// maxRegisterBody bounds a /register body. It carries one DeviceInfo —
+	// a handful of short strings — so this is already generous.
+	maxRegisterBody = 64 << 10 // 64 KiB
+
+	// maxPrepareBody bounds a /prepare-upload body. This one scales with the
+	// number of files in a folder send (roughly 200 bytes of metadata each),
+	// so it is sized for a very large folder, not a single file.
+	maxPrepareBody = 8 << 20 // 8 MiB
+
+	// maxMessageText bounds the text of an inbound message. Messages ride in
+	// the preview field of prepare-upload, so without this a peer could park
+	// most of maxPrepareBody in the message channel.
+	maxMessageText = 64 << 10 // 64 KiB
+)
+
+// Deadlines. ReadHeaderTimeout on the Server covers the headers; these cover
+// the body, which is where a peer can otherwise dribble bytes forever.
+const (
+	// jsonReadTimeout is the whole-body deadline for the small JSON endpoints.
+	// None of them has any reason to take this long.
+	jsonReadTimeout = 15 * time.Second
+
+	// uploadStallTimeout is a stall deadline, not a total one: it is pushed
+	// forward every time bytes actually arrive. A legitimate transfer can run
+	// as long as it likes; a connection that simply stops sending is dropped.
+	uploadStallTimeout = 60 * time.Second
+)
+
+// setReadDeadline pushes the read deadline out by d. It is best-effort: a
+// connection type that cannot carry a deadline just leaves it unset.
+func setReadDeadline(w http.ResponseWriter, d time.Duration) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(d))
+}
+
+// stallGuard extends the read deadline whenever the peer makes progress, so a
+// slow-but-moving upload survives while an idle one is cut off.
+type stallGuard struct {
+	r       io.Reader
+	w       http.ResponseWriter
+	timeout time.Duration
+}
+
+func (g *stallGuard) Read(p []byte) (int, error) {
+	setReadDeadline(g.w, g.timeout)
+	return g.r.Read(p)
+}
 
 // Options configures a Server.
 type Options struct {
@@ -52,6 +105,8 @@ type Server struct {
 	accepts   chan AcceptRequest
 	transfers chan transfer.Event
 	messages  chan ReceivedMessage
+
+	pinLimit *pinLimiter
 }
 
 // ReceivedMessage is a plain-text message received from a peer (LocalSend
@@ -73,6 +128,7 @@ func New(opts Options) *Server {
 		accepts:    make(chan AcceptRequest, 8),
 		transfers:  make(chan transfer.Event, 256),
 		messages:   make(chan ReceivedMessage, 32),
+		pinLimit:   newPINLimiter(),
 	}
 	s.autoAccept.Store(opts.AutoAccept)
 	mux := http.NewServeMux()
@@ -156,14 +212,17 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	setReadDeadline(w, jsonReadTimeout)
 	writeJSON(w, s.infoCopy())
 }
 
 // handleRegister records the calling peer and replies with our own info.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	setReadDeadline(w, jsonReadTimeout)
 	if s.opts.OnPeer != nil {
 		var info protocol.DeviceInfo
-		if err := json.NewDecoder(r.Body).Decode(&info); err == nil && info.Fingerprint != "" {
+		body := http.MaxBytesReader(w, r.Body, maxRegisterBody)
+		if err := json.NewDecoder(body).Decode(&info); err == nil && info.Fingerprint != "" {
 			dbg.Logf("register from %s: alias=%q proto=%s port=%d", clientIP(r), info.Alias, info.Protocol, info.Port)
 			s.opts.OnPeer(info, clientIP(r))
 		} else if err != nil {
@@ -175,8 +234,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 // handlePrepareUpload asks the user to accept, then issues a session + tokens.
 func (s *Server) handlePrepareUpload(w http.ResponseWriter, r *http.Request) {
+	setReadDeadline(w, jsonReadTimeout)
 	var req protocol.PrepareUploadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	body := http.MaxBytesReader(w, r.Body, maxPrepareBody)
+	if err := json.NewDecoder(body).Decode(&req); err != nil {
+		dbg.Logf("prepare-upload from %s: decode error: %v", clientIP(r), err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -192,10 +254,22 @@ func (s *Server) handlePrepareUpload(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	pin := s.pin
 	s.mu.Unlock()
-	if pin != "" && r.URL.Query().Get("pin") != pin {
-		dbg.Logf("prepare-upload from %s: PIN missing/incorrect -> 401", clientIP(r))
-		http.Error(w, "pin required", http.StatusUnauthorized)
-		return
+	if pin != "" {
+		ip := clientIP(r)
+		// Lockout first, and without comparing: a locked-out source learns
+		// nothing about the PIN, not even from a correct guess.
+		if s.pinLimit.locked(ip) {
+			dbg.Logf("prepare-upload from %s: PIN locked out -> 429", ip)
+			http.Error(w, "too many attempts", http.StatusTooManyRequests)
+			return
+		}
+		if !pinMatches(r.URL.Query().Get("pin"), pin) {
+			s.pinLimit.fail(ip)
+			dbg.Logf("prepare-upload from %s: PIN missing/incorrect -> 401", ip)
+			http.Error(w, "pin required", http.StatusUnauthorized)
+			return
+		}
+		s.pinLimit.success(ip)
 	}
 
 	// A "message" is a single text file whose content rides in the preview
@@ -212,7 +286,12 @@ func (s *Server) handlePrepareUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, tokens := s.sessions.create(req.Info, clientIP(r), req.Files)
+	sess, tokens, err := s.sessions.create(req.Info, clientIP(r), req.Files)
+	if err != nil {
+		dbg.Logf("prepare-upload from %s: %v", clientIP(r), err)
+		http.Error(w, "too many pending sessions", http.StatusTooManyRequests)
+		return
+	}
 	writeJSON(w, protocol.PrepareUploadResponse{SessionID: sess.id, Files: tokens})
 }
 
@@ -224,6 +303,9 @@ func messageOf(files map[string]protocol.FileMetadata) (string, bool) {
 	}
 	for _, f := range files {
 		if f.Preview != "" && isTextType(f.FileType) {
+			if len(f.Preview) > maxMessageText {
+				return "", false // over-long: treat as a file, not a message
+			}
 			return f.Preview, true
 		}
 	}
@@ -276,14 +358,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	sessionID, fileID, token := q.Get("sessionId"), q.Get("fileId"), q.Get("token")
 
-	sess, fe, ok := s.sessions.lookup(sessionID, fileID, token)
+	sess, fe, ok := s.sessions.claim(sessionID, fileID, token)
 	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	defer s.sessions.endUpload(sessionID, fileID)
 
 	key := sessionID + ":" + fileID
-	dest, err := s.writeFile(sess, fe, key, r.Body)
+	body := &stallGuard{r: r.Body, w: w, timeout: uploadStallTimeout}
+	dest, err := s.writeFile(sess, fe, key, body)
 	if err != nil {
 		s.transfers <- transfer.Event{Dir: transfer.Incoming, Kind: transfer.Error, ID: key, FileName: fe.meta.FileName, Err: err}
 		http.Error(w, "write failed", http.StatusInternalServerError)
@@ -309,13 +393,21 @@ func (s *Server) writeFile(sess *session, fe *fileEntry, key string, r io.Reader
 	}
 	tmp := dest + ".part"
 
-	f, err := os.Create(tmp)
+	// O_EXCL|O_NOFOLLOW: never write through a symlink or into a file someone
+	// else placed at this path between uniqueAt and here.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return "", err
 	}
 
+	// Bound the stream by the size declared in prepare-upload — the figure the
+	// user saw and accepted. Without this a peer can declare a small file and
+	// then stream until the disk fills. One byte of headroom lets us tell
+	// "exactly the declared size" from "more than declared" below.
+	limited := io.LimitReader(r, fe.meta.Size+1)
+
 	pr := &progressReader{
-		r:     r,
+		r:     limited,
 		total: fe.meta.Size,
 		ctx:   sess.ctx,
 		emit: func(received int64) {
@@ -327,7 +419,7 @@ func (s *Server) writeFile(sess *session, fe *fileEntry, key string, r io.Reader
 	}
 	s.transfers <- transfer.Event{Dir: transfer.Incoming, Kind: transfer.Start, ID: key, FileName: fe.meta.FileName, Total: fe.meta.Size}
 
-	_, copyErr := io.Copy(f, pr)
+	written, copyErr := io.Copy(f, pr)
 	closeErr := f.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmp)
@@ -336,6 +428,10 @@ func (s *Server) writeFile(sess *session, fe *fileEntry, key string, r io.Reader
 		}
 		return "", closeErr
 	}
+	if written > fe.meta.Size {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("sender exceeded declared size of %d bytes for %q", fe.meta.Size, fe.meta.FileName)
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return "", err
 	}
@@ -343,6 +439,7 @@ func (s *Server) writeFile(sess *session, fe *fileEntry, key string, r io.Reader
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	setReadDeadline(w, jsonReadTimeout)
 	sessionID := r.URL.Query().Get("sessionId")
 	s.sessions.cancel(sessionID)
 	s.transfers <- transfer.Event{Dir: transfer.Incoming, Kind: transfer.Cancel, ID: sessionID}
@@ -366,13 +463,39 @@ func destPath(dir, name string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", err
 	}
+	// The check above is lexical, so it cannot see a symlink standing in for
+	// one of the directories we just walked through — a folder send whose
+	// path crosses a link would land outside the receive dir entirely. Resolve
+	// both sides and confirm containment for real before handing back a path.
+	if err := confirmInside(dir, filepath.Dir(full)); err != nil {
+		return "", err
+	}
 	return uniqueAt(full), nil
+}
+
+// confirmInside reports whether child, with every symlink resolved, is still
+// dir or below it.
+func confirmInside(dir, child string) error {
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("receive dir %q: %w", dir, err)
+	}
+	realChild, err := filepath.EvalSymlinks(child)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w", child, err)
+	}
+	if realChild != realDir && !strings.HasPrefix(realChild, realDir+string(os.PathSeparator)) {
+		return fmt.Errorf("destination %q resolves outside the receive dir", child)
+	}
+	return nil
 }
 
 // uniqueAt returns full if free, otherwise inserts " (n)" before the extension
 // until it finds an unused name in the same directory.
 func uniqueAt(full string) string {
-	if _, err := os.Stat(full); os.IsNotExist(err) {
+	// Lstat, not Stat: a dangling symlink must count as occupied, or we would
+	// hand back its path and write through the link to wherever it points.
+	if _, err := os.Lstat(full); os.IsNotExist(err) {
 		return full
 	}
 	d := filepath.Dir(full)
@@ -381,7 +504,7 @@ func uniqueAt(full string) string {
 	stem := base[:len(base)-len(ext)]
 	for i := 1; ; i++ {
 		cand := filepath.Join(d, fmt.Sprintf("%s (%d)%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
+		if _, err := os.Lstat(cand); os.IsNotExist(err) {
 			return cand
 		}
 	}
