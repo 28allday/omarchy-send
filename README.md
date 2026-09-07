@@ -152,7 +152,7 @@ anything routable, [Tailscale](https://tailscale.com) being the easy, secure cho
 2. Either let omarchy-send **auto-discover** online tailnet peers (it probes them
    every few seconds; any running omarchy-send/LocalSend appears in Devices), or
    press **`+`** on the Devices tab and enter a host, IP, or Tailscale name (e.g.
-   `colossus`). Added devices are saved to `knownPeers` in the config and re-probed
+   `workstation`). Added devices are saved to `knownPeers` in the config and re-probed
    on every launch.
 
 The receiver already listens on all interfaces, so it's reachable at its Tailscale
